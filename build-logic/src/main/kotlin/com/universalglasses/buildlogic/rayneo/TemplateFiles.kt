@@ -7,7 +7,7 @@ internal data class TemplateFile(
 
 internal object RayneoHostTemplate {
     // Bump this if you change any template content so the generator knows when to refresh.
-    const val TEMPLATE_VERSION = 15
+    const val TEMPLATE_VERSION = 19
 
     fun files(): List<TemplateFile> = listOf(
         TemplateFile(
@@ -76,6 +76,8 @@ internal object RayneoHostTemplate {
 
                 <uses-permission android:name="android.permission.CAMERA" />
                 <uses-permission android:name="android.permission.RECORD_AUDIO" />
+                <!-- Needed on some devices/ROMs for adjusting stream volume programmatically -->
+                <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
 
                 <application
                     android:name=".UgRayneoHostApplication"
@@ -175,6 +177,8 @@ internal object RayneoHostTemplate {
             package com.universalglasses.rayneo.host
 
             import android.Manifest
+            import android.content.Context
+            import android.media.AudioManager
             import android.os.Bundle
             import android.widget.Button
             import androidx.activity.result.contract.ActivityResultContracts
@@ -236,6 +240,8 @@ internal object RayneoHostTemplate {
 
                 override fun onCreate(savedInstanceState: Bundle?) {
                     super.onCreate(savedInstanceState)
+                    // Best-effort: avoid "silent by default" media stream.
+                    ensureMusicVolumeNotZero()
                     // Request permissions early; commands will no-op until permissions are granted.
                     ensureCameraPermission()
                     ensureMicPermission()
@@ -391,6 +397,22 @@ internal object RayneoHostTemplate {
                         return false
                     }
                     return true
+                }
+
+                private fun ensureMusicVolumeNotZero() {
+                    try {
+                        val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                        val stream = AudioManager.STREAM_MUSIC
+                        val cur = am.getStreamVolume(stream)
+                        val max = am.getStreamMaxVolume(stream)
+                        if (cur <= 0 && max > 0) {
+                            // Set to a reasonable audible value (not max) to avoid blasting volume.
+                            val target = (max / 2).coerceAtLeast(1)
+                            am.setStreamVolume(stream, target, 0)
+                        }
+                    } catch (_: Exception) {
+                        // ignore
+                    }
                 }
             }
             """.trimIndent(),

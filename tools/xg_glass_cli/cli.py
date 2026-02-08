@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import platform
 import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
+import urllib.error
+import urllib.request
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -15,6 +20,10 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_SDK = REPO_ROOT
 DEFAULT_TEMPLATE = REPO_ROOT / "templates" / "kotlin-app"
 DEFAULT_CONFIG_FILE = "xg-glass.yaml"
+
+# Managed Flutter SDK location
+_XG_GLASS_HOME = Path.home() / ".xg-glass"
+_MANAGED_FLUTTER_DIR = _XG_GLASS_HOME / "flutter"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -238,7 +247,7 @@ def cmd_install(args: argparse.Namespace) -> int:
     if not apk.exists():
         raise FileNotFoundError(f"APK not found: {apk}")
 
-    cmd = ["adb"]
+    cmd = [_find_adb_cmd()]
     if args.serial:
         cmd += ["-s", args.serial]
     cmd += ["install", "-r", str(apk)]
@@ -298,6 +307,9 @@ def cmd_run(args: argparse.Namespace) -> int:
                 rayneo_aar_dir=None,
             )
         )
+        # When --sim, ensure an emulator is running before installing.
+        if bool(getattr(args, "sim", False)):
+            _ensure_emulator_running(serial=args.serial)
         cmd_install(
             argparse.Namespace(
                 project=str(project_dir),
@@ -340,7 +352,7 @@ def _run_project(args: argparse.Namespace) -> int:
     module = cfg.module
     package_name = args.package or cfg.application_id or _read_application_id(project, module) or "com.example.xgglassapp"
 
-    cmd = ["adb"]
+    cmd = [_find_adb_cmd()]
     if getattr(args, "serial", None):
         cmd += ["-s", args.serial]
     # Use monkey to avoid hardcoding activity component.
@@ -377,7 +389,7 @@ def _pick_apk(project: Path, module: str, variant: str, serial: str | None) -> P
 
 
 def _adb_getprop(prop: str, serial: str | None) -> str | None:
-    cmd = ["adb"]
+    cmd = [_find_adb_cmd()]
     if serial:
         cmd += ["-s", serial]
     cmd += ["shell", "getprop", prop]
@@ -395,6 +407,181 @@ def _read_application_id(project: Path, module: str) -> str | None:
     s = f.read_text(encoding="utf-8")
     m = re.search(r'applicationId\s*=\s*"([^"]+)"', s)
     return m.group(1) if m else None
+
+
+def _adb_has_device(serial: str | None = None) -> bool:
+    """Return True if at least one device/emulator is connected via adb."""
+    adb = _find_adb_cmd()
+    try:
+        out = subprocess.check_output([adb, "devices"], text=True, stderr=subprocess.DEVNULL)
+        for line in out.strip().splitlines()[1:]:
+            if line.strip() and "device" in line:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _find_emulator_cmd() -> str | None:
+    """Locate the Android emulator binary."""
+    p = shutil.which("emulator")
+    if p:
+        return p
+    sdk = _find_android_sdk()
+    if sdk:
+        name = "emulator.exe" if platform.system() == "Windows" else "emulator"
+        candidate = Path(sdk) / "emulator" / name
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
+def _list_avds() -> list[str]:
+    """List available Android Virtual Devices."""
+    emu = _find_emulator_cmd()
+    if not emu:
+        return []
+    try:
+        out = subprocess.check_output([emu, "-list-avds"], text=True, stderr=subprocess.DEVNULL)
+        return [line.strip() for line in out.strip().splitlines() if line.strip()]
+    except Exception:
+        return []
+
+
+def _ensure_emulator_running(serial: str | None = None) -> None:
+    """
+    If ``--sim`` is active and no device/emulator is connected, auto-start an AVD.
+
+    Downloads the emulator + a system image via sdkmanager if needed, creates a
+    default AVD if none exists, launches it, and waits for it to boot.
+    """
+    if _adb_has_device(serial):
+        return
+
+    print("No connected device or emulator found. Starting Android Emulator...")
+
+    sdk = _find_android_sdk()
+    if not sdk:
+        raise RuntimeError(
+            "Cannot start emulator: Android SDK not found.\n"
+            "Please connect a device or start an emulator manually."
+        )
+
+    # Ensure emulator + system image are installed.
+    system = platform.system().lower()
+    sdkmanager_name = "sdkmanager.bat" if system == "windows" else "sdkmanager"
+    sdkmanager = Path(sdk) / "cmdline-tools" / "latest" / "bin" / sdkmanager_name
+    if not sdkmanager.exists():
+        # Try alternate location
+        sdkmanager = Path(sdk) / "tools" / "bin" / sdkmanager_name
+    if not sdkmanager.exists():
+        raise RuntimeError(
+            "sdkmanager not found. Cannot install emulator packages.\n"
+            "Please start an emulator manually."
+        )
+
+    emu = _find_emulator_cmd()
+    if not emu:
+        print("  Installing emulator package...")
+        env = {**os.environ, "ANDROID_HOME": sdk, "ANDROID_SDK_ROOT": sdk}
+        try:
+            subprocess.run(
+                [str(sdkmanager), f"--sdk_root={sdk}", "emulator", "system-images;android-34;google_apis;x86_64"],
+                input="y\n" * 20, text=True, env=env, check=True, timeout=600,
+            )
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(
+                f"Failed to install emulator packages: {exc}\n"
+                "Please start an emulator manually."
+            ) from exc
+        emu = _find_emulator_cmd()
+        if not emu:
+            raise RuntimeError("Emulator binary not found after installation. Please start an emulator manually.")
+
+    # Check / create AVD.
+    avds = _list_avds()
+    avd_name = avds[0] if avds else "xg_glass_avd"
+    if not avds:
+        # Ensure system image is installed
+        env = {**os.environ, "ANDROID_HOME": sdk, "ANDROID_SDK_ROOT": sdk}
+        sys_img = Path(sdk) / "system-images" / "android-34" / "google_apis" / "x86_64"
+        if not sys_img.is_dir():
+            print("  Installing system image...")
+            try:
+                subprocess.run(
+                    [str(sdkmanager), f"--sdk_root={sdk}", "system-images;android-34;google_apis;x86_64"],
+                    input="y\n" * 20, text=True, env=env, check=True, timeout=600,
+                )
+            except subprocess.CalledProcessError:
+                pass
+
+        print(f"  Creating AVD '{avd_name}'...")
+        avdmanager_name = "avdmanager.bat" if system == "windows" else "avdmanager"
+        avdmanager = Path(sdk) / "cmdline-tools" / "latest" / "bin" / avdmanager_name
+        if not avdmanager.exists():
+            avdmanager = Path(sdk) / "tools" / "bin" / avdmanager_name
+        if avdmanager.exists():
+            try:
+                subprocess.run(
+                    [
+                        str(avdmanager), "create", "avd",
+                        "-n", avd_name,
+                        "-k", "system-images;android-34;google_apis;x86_64",
+                        "-d", "pixel",
+                        "--force",
+                    ],
+                    input="no\n",  # don't customize hardware profile
+                    text=True, env=env, check=True, timeout=60,
+                )
+            except subprocess.CalledProcessError as exc:
+                raise RuntimeError(
+                    f"Failed to create AVD: {exc}\n"
+                    "Please create an AVD manually or start an emulator."
+                ) from exc
+        else:
+            raise RuntimeError("avdmanager not found. Please create an AVD manually.")
+
+    # Launch emulator in background.
+    print(f"  Launching emulator (AVD: {avd_name})...")
+    env = {**os.environ, "ANDROID_HOME": sdk, "ANDROID_SDK_ROOT": sdk}
+    subprocess.Popen(
+        [emu, "-avd", avd_name, "-no-snapshot-load"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=env,
+    )
+
+    # Wait for device to come online and finish booting.
+    import time
+    adb = _find_adb_cmd()
+    print("  Waiting for emulator to boot", end="", flush=True)
+    deadline = time.monotonic() + 180  # 3 minute timeout
+    while time.monotonic() < deadline:
+        time.sleep(3)
+        print(".", end="", flush=True)
+        try:
+            out = subprocess.check_output(
+                [adb, "devices"], text=True, stderr=subprocess.DEVNULL,
+            )
+            if any("emulator" in line and "device" in line for line in out.splitlines()):
+                # Check boot_completed
+                try:
+                    boot = subprocess.check_output(
+                        [adb, "shell", "getprop", "sys.boot_completed"],
+                        text=True, stderr=subprocess.DEVNULL, timeout=5,
+                    ).strip()
+                    if boot == "1":
+                        print(" Ready!")
+                        return
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    print()
+    raise RuntimeError(
+        "Emulator did not finish booting within 3 minutes.\n"
+        "Please start the emulator manually and re-run."
+    )
 
 
 def _apply_simulator_build_settings(project: Path, *, enabled: bool) -> None:
@@ -591,6 +778,10 @@ def _ensure_flutter_module_ready(project: Path, cfg: XgConfig) -> None:
     if not sdk.is_absolute():
         sdk = (project / sdk).resolve()
 
+    # Ensure the SDK root has local.properties with sdk.dir so that the
+    # Flutter module Gradle plugin can locate the Android SDK.
+    _ensure_sdk_local_properties(sdk)
+
     fm = sdk / "third_party" / "frame" / "frame_module"
     pubspec = fm / "pubspec.yaml"
     if not pubspec.exists():
@@ -614,11 +805,13 @@ def _ensure_flutter_module_ready(project: Path, cfg: XgConfig) -> None:
     # Missing package_config: run flutter pub get.
     flutter = _find_flutter_cmd()
     if not flutter:
-        raise RuntimeError(
-            "Flutter module is present but not initialized (missing .dart_tool/package_config.json), "
-            "and `flutter` was not found on PATH.\n"
-            f"Please install Flutter or run `flutter pub get` manually in: {fm}"
-        )
+        if os.environ.get("XG_NO_FLUTTER_DOWNLOAD", "").strip() not in ("", "0"):
+            raise RuntimeError(
+                "Flutter module is present but not initialized (missing .dart_tool/package_config.json), "
+                "and `flutter` was not found on PATH.\n"
+                f"Please install Flutter or run `flutter pub get` manually in: {fm}"
+            )
+        flutter = _auto_download_flutter()
 
     _run([flutter, "pub", "get"], cwd=fm)
 
@@ -640,13 +833,130 @@ def _wipe_flutter_caches(fm: Path) -> None:
             shutil.rmtree(p, ignore_errors=True)
 
 
+def _managed_flutter_bin() -> Path:
+    """Return the expected path to the managed Flutter binary."""
+    name = "flutter.bat" if platform.system() == "Windows" else "flutter"
+    return _MANAGED_FLUTTER_DIR / "flutter" / "bin" / name
+
+
+def _download_progress(block_num: int, block_size: int, total_size: int) -> None:
+    """Report download progress to stdout."""
+    if total_size > 0:
+        downloaded = block_num * block_size
+        pct = min(100, downloaded * 100 // total_size)
+        mb_done = downloaded / (1024 * 1024)
+        mb_total = total_size / (1024 * 1024)
+        sys.stdout.write(f"\r  Progress: {pct}% ({mb_done:.1f} / {mb_total:.1f} MB)")
+        sys.stdout.flush()
+
+
+def _auto_download_flutter() -> str:
+    """
+    Download the latest stable Flutter SDK into ``~/.xg-glass/flutter/``
+    and return the path to the ``flutter`` binary.
+    """
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+
+    os_name = {"darwin": "macos", "windows": "windows"}.get(system, "linux")
+    arch = "arm64" if machine in ("arm64", "aarch64") else "x64"
+
+    print("Flutter SDK not found. Downloading latest stable Flutter SDK...")
+    print(f"  Install location: {_MANAGED_FLUTTER_DIR}")
+
+    # Fetch the release manifest for this platform.
+    releases_url = (
+        "https://storage.googleapis.com/flutter_infra_release/releases/"
+        f"releases_{os_name}.json"
+    )
+    try:
+        with urllib.request.urlopen(releases_url, timeout=30) as resp:
+            data = json.loads(resp.read())
+    except (urllib.error.URLError, OSError) as exc:
+        raise RuntimeError(
+            f"Failed to fetch Flutter release information: {exc}\n"
+            "Please install Flutter manually: https://docs.flutter.dev/get-started/install"
+        ) from exc
+
+    stable_hash = data["current_release"]["stable"]
+    base_url = data["base_url"]
+
+    # Pick the release that matches hash + arch.
+    candidates = [r for r in data["releases"] if r["hash"] == stable_hash]
+    release = None
+    for c in candidates:
+        if c.get("dart_sdk_arch", "x64") == arch:
+            release = c
+            break
+    if release is None and candidates:
+        release = candidates[0]
+    if release is None:
+        raise RuntimeError(
+            "Could not find a stable Flutter release for your platform.\n"
+            "Please install Flutter manually: https://docs.flutter.dev/get-started/install"
+        )
+
+    archive_url = base_url + "/" + release["archive"]
+    version = release["version"]
+    archive_name = release["archive"].rsplit("/", 1)[-1]
+
+    _MANAGED_FLUTTER_DIR.mkdir(parents=True, exist_ok=True)
+    archive_path = _MANAGED_FLUTTER_DIR / archive_name
+
+    print(f"  Flutter version: {version}")
+    print(f"  Downloading from: {archive_url}")
+
+    try:
+        urllib.request.urlretrieve(archive_url, str(archive_path), _download_progress)
+        print()  # newline after progress bar
+    except (urllib.error.URLError, OSError) as exc:
+        archive_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"Failed to download Flutter SDK: {exc}\n"
+            "Please install Flutter manually: https://docs.flutter.dev/get-started/install"
+        ) from exc
+
+    print("  Extracting...")
+    try:
+        if archive_name.endswith(".zip"):
+            with zipfile.ZipFile(str(archive_path), "r") as zf:
+                zf.extractall(str(_MANAGED_FLUTTER_DIR))
+        elif archive_name.endswith((".tar.xz", ".tar.gz")):
+            with tarfile.open(str(archive_path), "r:*") as tf:
+                if sys.version_info >= (3, 12):
+                    tf.extractall(str(_MANAGED_FLUTTER_DIR), filter="fully_trusted")
+                else:
+                    tf.extractall(str(_MANAGED_FLUTTER_DIR))
+        else:
+            raise RuntimeError(f"Unknown archive format: {archive_name}")
+    finally:
+        archive_path.unlink(missing_ok=True)
+
+    flutter_bin = _managed_flutter_bin()
+    if not flutter_bin.exists():
+        raise RuntimeError(
+            f"Flutter SDK extracted but binary not found at: {flutter_bin}\n"
+            "Please install Flutter manually: https://docs.flutter.dev/get-started/install"
+        )
+
+    print(f"  Flutter SDK {version} installed successfully.")
+    return str(flutter_bin)
+
+
 def _find_flutter_cmd() -> str | None:
+    """Find Flutter: FLUTTER env-var -> PATH -> managed install."""
     # Allow explicit override via env var
     env = os.environ.get("FLUTTER")
     if env:
         return env
     p = shutil.which("flutter")
-    return p
+    if p:
+        return p
+    # Check managed installation
+    managed = _managed_flutter_bin()
+    if managed.exists():
+        return str(managed)
+    return None
 
 
 def _parse_simple_yaml(text: str) -> dict[str, str]:
@@ -685,14 +995,200 @@ def _ensure_executable(path: Path) -> None:
     path.chmod(mode | 0o111)
 
 
+# Default Android SDK packages required for building.
+_ANDROID_SDK_PACKAGES = [
+    "platform-tools",
+    "platforms;android-34",
+    "build-tools;34.0.0",
+]
+
+_MANAGED_ANDROID_SDK_DIR = _XG_GLASS_HOME / "android-sdk"
+
+
+def _find_adb_cmd() -> str:
+    """Locate the ``adb`` binary, checking PATH and the managed Android SDK."""
+    p = shutil.which("adb")
+    if p:
+        return p
+    sdk = _find_android_sdk()
+    if sdk:
+        name = "adb.exe" if platform.system() == "Windows" else "adb"
+        candidate = Path(sdk) / "platform-tools" / name
+        if candidate.exists():
+            return str(candidate)
+    return "adb"  # fallback – let the OS raise a clear error
+
+
+def _find_android_sdk() -> str | None:
+    """Locate the Android SDK directory from environment or common default paths."""
+    sdk = os.environ.get("ANDROID_SDK_ROOT") or os.environ.get("ANDROID_HOME")
+    if sdk:
+        return sdk
+    # Check common default locations
+    system = platform.system()
+    candidates: list[Path] = []
+    if system == "Windows":
+        local_app = os.environ.get("LOCALAPPDATA", "")
+        if local_app:
+            candidates.append(Path(local_app) / "Android" / "Sdk")
+        home = Path.home()
+        candidates.append(home / "AppData" / "Local" / "Android" / "Sdk")
+    elif system == "Darwin":
+        candidates.append(Path.home() / "Library" / "Android" / "sdk")
+    else:
+        candidates.append(Path.home() / "Android" / "Sdk")
+    # Also check managed install
+    candidates.append(_MANAGED_ANDROID_SDK_DIR)
+    for c in candidates:
+        if c.is_dir() and (c / "platform-tools").is_dir():
+            return str(c)
+    return None
+
+
+def _auto_download_android_sdk() -> str:
+    """
+    Download the Android SDK command-line tools into ``~/.xg-glass/android-sdk/``
+    and install the minimum required packages.  Returns the SDK root path.
+    """
+    system = platform.system().lower()
+    os_tag = {"darwin": "mac", "windows": "win"}.get(system, "linux")
+
+    print("Android SDK not found. Downloading Android SDK command-line tools...")
+    print(f"  Install location: {_MANAGED_ANDROID_SDK_DIR}")
+
+    url = f"https://dl.google.com/android/repository/commandlinetools-{os_tag}-11076708_latest.zip"
+
+    _MANAGED_ANDROID_SDK_DIR.mkdir(parents=True, exist_ok=True)
+    archive_path = _MANAGED_ANDROID_SDK_DIR / "cmdline-tools.zip"
+
+    print(f"  Downloading from: {url}")
+    try:
+        urllib.request.urlretrieve(url, str(archive_path), _download_progress)
+        print()  # newline after progress
+    except (urllib.error.URLError, OSError) as exc:
+        archive_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"Failed to download Android SDK command-line tools: {exc}\n"
+            "Please install the Android SDK manually: https://developer.android.com/studio"
+        ) from exc
+
+    print("  Extracting...")
+    try:
+        with zipfile.ZipFile(str(archive_path), "r") as zf:
+            zf.extractall(str(_MANAGED_ANDROID_SDK_DIR))
+    finally:
+        archive_path.unlink(missing_ok=True)
+
+    # The zip extracts to cmdline-tools/ – sdkmanager expects the layout:
+    #   <sdk>/cmdline-tools/latest/bin/sdkmanager
+    extracted = _MANAGED_ANDROID_SDK_DIR / "cmdline-tools"
+    dest = _MANAGED_ANDROID_SDK_DIR / "cmdline-tools" / "latest"
+    if extracted.is_dir() and not dest.exists():
+        # The archive puts files directly under cmdline-tools/ (with bin/, lib/).
+        # Move them into cmdline-tools/latest/.
+        tmp = _MANAGED_ANDROID_SDK_DIR / "_cmdline_tmp"
+        extracted.rename(tmp)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp.rename(dest)
+
+    if system == "windows":
+        sdkmanager = dest / "bin" / "sdkmanager.bat"
+    else:
+        sdkmanager = dest / "bin" / "sdkmanager"
+        if sdkmanager.exists():
+            sdkmanager.chmod(sdkmanager.stat().st_mode | 0o111)
+
+    if not sdkmanager.exists():
+        raise RuntimeError(
+            f"sdkmanager not found at: {sdkmanager}\n"
+            "Please install the Android SDK manually: https://developer.android.com/studio"
+        )
+
+    # Accept licenses and install required packages.
+    sdk_root = str(_MANAGED_ANDROID_SDK_DIR)
+    env = {**os.environ, "ANDROID_HOME": sdk_root, "ANDROID_SDK_ROOT": sdk_root}
+
+    print("  Accepting licenses...")
+    try:
+        # Pipe "y" answers to accept all licenses.
+        proc = subprocess.run(
+            [str(sdkmanager), f"--sdk_root={sdk_root}", "--licenses"],
+            input="y\n" * 20,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+    except Exception:
+        pass  # best-effort – install will also prompt
+
+    print(f"  Installing SDK packages: {', '.join(_ANDROID_SDK_PACKAGES)}")
+    try:
+        subprocess.run(
+            [str(sdkmanager), f"--sdk_root={sdk_root}"] + _ANDROID_SDK_PACKAGES,
+            input="y\n" * 20,
+            text=True,
+            env=env,
+            check=True,
+            timeout=600,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            f"Failed to install Android SDK packages: {exc}\n"
+            "Please install the Android SDK manually: https://developer.android.com/studio"
+        ) from exc
+
+    print("  Android SDK installed successfully.")
+    return sdk_root
+
+
+def _ensure_sdk_local_properties(sdk_root: Path) -> None:
+    """
+    Ensure ``local.properties`` exists in the SDK root with a valid ``sdk.dir``.
+
+    The Flutter module Gradle plugin resolves inside the included SDK build
+    and requires the Android SDK location.  Without ``local.properties`` at
+    the SDK root Gradle fails with "SDK location not found".
+    """
+    lp = sdk_root / "local.properties"
+    if lp.exists():
+        # Check if it actually has sdk.dir set to a valid path.
+        try:
+            text = lp.read_text(encoding="utf-8", errors="ignore")
+            for line in text.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("sdk.dir=") and not stripped.startswith("sdk.dir=#"):
+                    val = stripped.split("=", 1)[1].strip()
+                    if val and Path(val.replace("/", os.sep)).is_dir():
+                        return  # valid sdk.dir already set
+        except Exception:
+            pass
+    sdk_dir = _find_android_sdk()
+    if not sdk_dir:
+        if os.environ.get("XG_NO_ANDROID_DOWNLOAD", "").strip() not in ("", "0"):
+            return  # user opted out
+        sdk_dir = _auto_download_android_sdk()
+    # Normalise to forward slashes (Gradle properties file convention).
+    sdk_dir_escaped = sdk_dir.replace("\\", "/")
+    lp.write_text(
+        "## Auto-generated by xg-glass CLI – do NOT commit.\n"
+        f"sdk.dir={sdk_dir_escaped}\n",
+        encoding="utf-8",
+    )
+
+
 def _write_local_properties(project: Path) -> None:
-    sdk_dir = os.environ.get("ANDROID_SDK_ROOT") or os.environ.get("ANDROID_HOME")
+    sdk_dir = _find_android_sdk()
+    if not sdk_dir:
+        if os.environ.get("XG_NO_ANDROID_DOWNLOAD", "").strip() in ("", "0"):
+            sdk_dir = _auto_download_android_sdk()
     lp = project / "local.properties"
     if sdk_dir:
+        sdk_dir_escaped = sdk_dir.replace("\\", "/")
         lp.write_text(
             "## Auto-generated by xg-glass init\n"
             "## This file must *NOT* be checked into VCS.\n"
-            f"sdk.dir={sdk_dir}\n"
+            f"sdk.dir={sdk_dir_escaped}\n"
             "\n"
             "## Rokid (optional): CXR-M v1.0.4 SN authorization\n"
             "## - Put sn_*.lc under app/src/main/res/raw/\n"
